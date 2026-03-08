@@ -21,7 +21,7 @@ from flask import Flask, request, abort
 # ─────────────────────────────────────────
 BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
 WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]          # any random string you choose
-RAILWAY_URL    = os.environ["RAILWAY_PUBLIC_DOMAIN"]   # set automatically by Railway, e.g. myapp.up.railway.app
+RAILWAY_URL    = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_STATIC_URL", "")  # your Railway domain
 UPSTASH_URL    = os.environ["UPSTASH_REDIS_REST_URL"]
 UPSTASH_TOKEN  = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
@@ -133,6 +133,9 @@ def broadcast(text: str):
         send(cid, text)
 
 def register_webhook():
+    if not RAILWAY_URL:
+        log.error("RAILWAY_PUBLIC_DOMAIN is not set. Go to Railway → Settings → Networking → Generate Domain, then add RAILWAY_PUBLIC_DOMAIN=yourapp.up.railway.app in Variables.")
+        return
     url = f"https://{RAILWAY_URL}/webhook/{WEBHOOK_SECRET}"
     resp = requests.post(
         f"{TELEGRAM_API}/setWebhook",
