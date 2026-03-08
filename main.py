@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Gate.io Funding Rate Monitor Bot — Railway-ready (webhook mode)
+Gate.io Funding Rate Monitor Bot — Railway-ready (long polling)
 
 Architecture:
-  - Flask web server handles Telegram webhook POSTs  → Railway health check passes
-  - Background thread runs the funding rate monitor  → alerts on rate changes
-  - Upstash Redis persists tickers, rates, chat list
+  - Minimal HTTP server on $PORT  → satisfies Railway health check
+  - Long polling thread           → receives Telegram commands
+  - Monitor thread                → checks funding rates, sends alerts
+  - Upstash Redis                 → persists tickers, rates, chat list
 """
 
 import os
@@ -14,18 +15,16 @@ import logging
 import threading
 import requests
 from datetime import datetime, timezone
-from flask import Flask, request, abort
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 # ─────────────────────────────────────────
 # ENV CONFIG — set these in Railway Variables
 # ─────────────────────────────────────────
 BOT_TOKEN      = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_SECRET = os.environ["WEBHOOK_SECRET"]          # any random string you choose
-RAILWAY_URL    = os.environ.get("RAILWAY_PUBLIC_DOMAIN") or os.environ.get("RAILWAY_STATIC_URL", "")  # your Railway domain
 UPSTASH_URL    = os.environ["UPSTASH_REDIS_REST_URL"]
 UPSTASH_TOKEN  = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL_SEC", "60"))
-PORT           = int(os.getenv("PORT", "8080"))        # Railway injects PORT automatically
+PORT           = int(os.getenv("PORT", "8080"))
 # ─────────────────────────────────────────
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
@@ -36,7 +35,29 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
-app = Flask(__name__)
+
+
+# ══════════════════════════════════════════
+#  HEALTH CHECK SERVER
+# ══════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        tickers = sorted(get_tickers())
+        body = f"ok | tickers: {', '.join(tickers) or 'none'}".encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # suppress default HTTP logs
+
+
+def start_health_server():
+    server = HTTPServer(("0.0.0.0", PORT), HealthHandler)
+    log.info(f"Health check server on port {PORT}")
+    server.serve_forever()
 
 
 # ══════════════════════════════════════════
@@ -116,7 +137,7 @@ def fetch_funding_rate(contract: str) -> dict | None:
 
 
 # ══════════════════════════════════════════
-#  TELEGRAM HELPERS
+#  TELEGRAM
 # ══════════════════════════════════════════
 
 def send(chat_id, text: str, reply_to: int = None):
@@ -131,22 +152,6 @@ def send(chat_id, text: str, reply_to: int = None):
 def broadcast(text: str):
     for cid in redis_smembers("funding_bot:chats"):
         send(cid, text)
-
-def register_webhook():
-    if not RAILWAY_URL:
-        log.error("RAILWAY_PUBLIC_DOMAIN is not set. Go to Railway → Settings → Networking → Generate Domain, then add RAILWAY_PUBLIC_DOMAIN=yourapp.up.railway.app in Variables.")
-        return
-    url = f"https://{RAILWAY_URL}/webhook/{WEBHOOK_SECRET}"
-    resp = requests.post(
-        f"{TELEGRAM_API}/setWebhook",
-        json={"url": url, "allowed_updates": ["message"]},
-        timeout=10,
-    )
-    result = resp.json()
-    if result.get("ok"):
-        log.info(f"Webhook registered: {url}")
-    else:
-        log.error(f"Webhook registration failed: {result}")
 
 
 # ══════════════════════════════════════════
@@ -181,7 +186,6 @@ def cmd_add(chat_id, args, mid):
         reply_to=mid,
     )
 
-
 def cmd_delete(chat_id, args, mid):
     if not args:
         send(chat_id, "⚠️ Usage: <code>/delete BTC_USDT</code>", reply_to=mid)
@@ -192,7 +196,6 @@ def cmd_delete(chat_id, args, mid):
     else:
         send(chat_id, f"ℹ️ <code>{contract}</code> wasn't in the list.", reply_to=mid)
 
-
 def cmd_list(chat_id, mid):
     tickers = sorted(get_tickers())
     if not tickers:
@@ -200,7 +203,6 @@ def cmd_list(chat_id, mid):
         return
     lines = "\n".join(f"  • <code>{t}</code>" for t in tickers)
     send(chat_id, f"📋 <b>Monitored tickers ({len(tickers)})</b>\n\n{lines}", reply_to=mid)
-
 
 def cmd_status(chat_id, mid):
     tickers = sorted(get_tickers())
@@ -222,7 +224,6 @@ def cmd_status(chat_id, mid):
         reply_to=mid,
     )
 
-
 def cmd_help(chat_id, mid):
     send(chat_id,
         "🤖 <b>Funding Rate Monitor</b>\n"
@@ -236,7 +237,6 @@ def cmd_help(chat_id, mid):
         reply_to=mid,
     )
 
-
 def handle_update(update: dict):
     msg  = update.get("message", {})
     text = msg.get("text", "")
@@ -244,7 +244,6 @@ def handle_update(update: dict):
         return
     chat_id = msg["chat"]["id"]
     mid     = msg["message_id"]
-    # Register chat for broadcast alerts
     redis_sadd("funding_bot:chats", str(chat_id))
     parts = text.strip().split()
     cmd   = parts[0].split("@")[0].lower()
@@ -258,45 +257,38 @@ def handle_update(update: dict):
 
 
 # ══════════════════════════════════════════
-#  FLASK ROUTES
+#  POLLING LOOP
 # ══════════════════════════════════════════
 
-@app.get("/")
-def health():
-    """Railway health check endpoint."""
-    tickers = sorted(get_tickers())
-    return {
-        "status":   "ok",
-        "tickers":  tickers,
-        "count":    len(tickers),
-        "checked":  datetime.now(timezone.utc).isoformat(),
-    }
-
-@app.post(f"/webhook/<secret>")
-def webhook(secret):
-    if secret != WEBHOOK_SECRET:
-        abort(403)
-    update = request.get_json(force=True, silent=True)
-    if update:
+def polling_loop():
+    log.info("Polling loop started.")
+    offset = int(redis_get("funding_bot:tg_offset") or "0")
+    while True:
         try:
-            handle_update(update)
+            resp = requests.get(
+                f"{TELEGRAM_API}/getUpdates",
+                params={"offset": offset, "timeout": 30, "allowed_updates": ["message"]},
+                timeout=40,
+            )
+            resp.raise_for_status()
+            for upd in resp.json().get("result", []):
+                offset = upd["update_id"] + 1
+                redis_set("funding_bot:tg_offset", offset)
+                handle_update(upd)
         except Exception as e:
-            log.error(f"Update handling error: {e}")
-    return "ok", 200
+            log.error(f"Poll error: {e}")
+            time.sleep(5)
 
 
 # ══════════════════════════════════════════
-#  MONITOR LOOP (background thread)
+#  MONITOR LOOP
 # ══════════════════════════════════════════
 
 def monitor_loop():
     log.info("Monitor loop started.")
     while True:
         time.sleep(CHECK_INTERVAL)
-        tickers = get_tickers()
-        if not tickers:
-            continue
-        for contract in tickers:
+        for contract in get_tickers():
             data = fetch_funding_rate(contract)
             if not data or data.get("error"):
                 continue
@@ -334,9 +326,9 @@ def monitor_loop():
 
 def main():
     log.info("Bot starting…")
-    register_webhook()
+    threading.Thread(target=start_health_server, daemon=True).start()
     threading.Thread(target=monitor_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=PORT)
+    polling_loop()  # main thread
 
 if __name__ == "__main__":
     main()
